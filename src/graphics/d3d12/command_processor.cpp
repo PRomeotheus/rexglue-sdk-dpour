@@ -3469,8 +3469,22 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_s
     return true;
   }
 
-  const uint64_t readback_key =
+  const uint64_t base_key =
       MakeMemexportReadbackKey(memexport_ranges_.front().base_address_dwords, total_size);
+  const uint32_t occurrence = memexport_occurrences_this_frame_[base_key]++;
+  if (occurrence >= kMemexportMaxOccurrencesPerFrame) {
+    // More repeats of one destination in a frame than the key can encode:
+    // stay correct and take the synchronous path. Logged so a game that hits
+    // this shows up in a log instead of as unexplained stutter.
+    if (memexport_occurrence_overflow_count_++ == 0) {
+      REXGPU_WARN(
+          "memexport readback: key {:016X} repeated more than {} times in one frame; "
+          "extra repeats use the synchronous path",
+          base_key, kMemexportMaxOccurrencesPerFrame);
+    }
+    return IssueDraw_MemexportReadbackFullPath(total_size);
+  }
+  const uint64_t readback_key = MakeMemexportOccurrenceKey(base_key, occurrence);
   ReadbackBuffer& readback = memexport_readback_buffers_[readback_key];
   readback.last_used_frame = frame_current_;
 
@@ -4218,6 +4232,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
     }
     EvictOldReadbackBuffers(readback_buffers_);
     EvictOldReadbackBuffers(memexport_readback_buffers_);
+    memexport_occurrences_this_frame_.clear();
 
     pix_capturing_ = pix_capture_requested_.exchange(false, std::memory_order_relaxed);
     if (pix_capturing_) {
@@ -5715,8 +5730,14 @@ void D3D12CommandProcessor::EvictOldReadbackBuffers(
                                             : 0;
   for (auto it = buffer_map.begin(); it != buffer_map.end();) {
     ReadbackBuffer& readback = it->second;
-    bool evict =
-        buffer_map.size() > kMaxReadbackBuffers || readback.last_used_frame < eviction_frame_floor;
+    // perf/memexport-pacing: the size cap used to evict ANY entry, including
+    // ones written by submissions still in flight (a GPU use-after-free) and
+    // ones in use every frame (which then re-entered the synchronous
+    // first-use path next frame). Only entries idle for longer than the frame
+    // queue are eligible now; age-based eviction is unchanged.
+    const bool idle_past_queue = readback.last_used_frame + kQueueFrames < frame_current_;
+    bool evict = (buffer_map.size() > kMaxReadbackBuffers && idle_past_queue) ||
+                 readback.last_used_frame < eviction_frame_floor;
     if (!evict) {
       ++it;
       continue;

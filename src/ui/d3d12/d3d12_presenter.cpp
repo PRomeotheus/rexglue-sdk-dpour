@@ -70,6 +70,22 @@ REXCVAR_DEFINE_DOUBLE(d3d12_present_frame_limiter_fps, 60.0, "UI/D3D12",
     .range(1.0, 1000.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// perf/memexport-pacing: how presents are paced.
+//   limiter - the dpour-v1.x behaviour: sleep to a host-clock 60 Hz cadence,
+//             then Present(0) with tearing allowed. The host clock and the
+//             display clock drift, which shows up as periodic judder on fixed
+//             refresh displays (and uneven 2/3 refresh steps at 144 Hz).
+//   display - present on the display's own clock: Present(N) where N is the
+//             display refresh divided by the target fps, rounded. No host
+//             timer at all.
+//   auto    - display when the refresh is an integer multiple of the target
+//             (60/120/240 Hz, 59.94 included), limiter otherwise (144/165 Hz,
+//             where a VRR display follows the limiter's presents).
+REXCVAR_DEFINE_STRING(d3d12_present_pacing, "auto", "UI/D3D12",
+                      "Present pacing: auto, display (vsync on the display clock) or limiter "
+                      "(host-clock cadence)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_INT32(d3d12_present_frame_limiter_sleep_margin_us, 1000, "UI/D3D12",
                      "How early the present limiter wakes before the target present time")
     .range(0, 5000)
@@ -90,6 +106,51 @@ uint64_t TicksToUsInteger(uint64_t ticks, uint64_t frequency) {
 
 uint64_t UsToTicksInteger(uint64_t us, uint64_t frequency) {
   return us * frequency / 1000000ull;
+}
+
+// Refresh rate of the monitor the window is on, in Hz, or 0 if unknown.
+// Re-queried every 240 calls so moving the window to another monitor or
+// changing the mode is picked up without a per-present system call.
+uint32_t QueryWindowRefreshHz(HWND hwnd) {
+  static HWND cached_hwnd = nullptr;
+  static uint32_t cached_hz = 0;
+  static uint32_t calls_since_query = 0;
+  if (hwnd == cached_hwnd && calls_since_query++ < 240) {
+    return cached_hz;
+  }
+  cached_hwnd = hwnd;
+  calls_since_query = 0;
+  cached_hz = 0;
+  HMONITOR monitor = hwnd ? MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) : nullptr;
+  MONITORINFOEXW monitor_info = {};
+  monitor_info.cbSize = sizeof(monitor_info);
+  if (monitor && GetMonitorInfoW(monitor, &monitor_info)) {
+    DEVMODEW mode = {};
+    mode.dmSize = sizeof(mode);
+    if (EnumDisplaySettingsW(monitor_info.szDevice, ENUM_CURRENT_SETTINGS, &mode) &&
+        mode.dmDisplayFrequency > 1) {
+      cached_hz = mode.dmDisplayFrequency;
+    }
+  }
+  return cached_hz;
+}
+
+// Sync interval that locks presents to the display clock at target_fps, or 0
+// when the display refresh is not (close to) an integer multiple of it.
+// Windows reports 59.94 Hz as 59, hence the 2.5% tolerance.
+UINT DisplaySyncInterval(uint32_t refresh_hz, double target_fps, bool force) {
+  if (!refresh_hz || target_fps < 1.0) {
+    return force ? 1 : 0;
+  }
+  const double ratio = double(refresh_hz) / target_fps;
+  const double rounded = std::max(1.0, std::floor(ratio + 0.5));
+  if (rounded > 4.0) {
+    return force ? 4 : 0;
+  }
+  if (std::abs(ratio - rounded) <= 0.025 * rounded) {
+    return UINT(rounded);
+  }
+  return force ? UINT(rounded) : 0;
 }
 
 void PreciseWaitUntilHostTick(uint64_t target_host_tick, uint64_t host_frequency) {
@@ -1301,7 +1362,24 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   paint_context_.paint_submission_tracker.NextSubmission();
   // Present immediately by default, but allow explicit host-side cadence
   // control for testing pacing independently of DXGI vsync.
-  if (REXCVAR_GET(d3d12_present_frame_limiter)) {
+  // perf/memexport-pacing: decide whether this present follows the display
+  // clock (vsync interval) or the host-clock limiter.
+  UINT display_sync_interval = 0;
+  {
+    const std::string& pacing = REXCVAR_GET(d3d12_present_pacing);
+    if (pacing != "limiter") {
+      HWND present_hwnd = nullptr;
+      paint_context_.swap_chain->GetHwnd(&present_hwnd);
+      display_sync_interval =
+          DisplaySyncInterval(QueryWindowRefreshHz(present_hwnd),
+                              REXCVAR_GET(d3d12_present_frame_limiter_fps), pacing == "display");
+    }
+  }
+  if (display_sync_interval) {
+    // The display paces presents; a stale limiter deadline must not carry
+    // over if pacing later switches back.
+    paint_context_.frame_limiter_next_present_tick = 0;
+  } else if (REXCVAR_GET(d3d12_present_frame_limiter)) {
     const double limiter_fps = REXCVAR_GET(d3d12_present_frame_limiter_fps);
     const uint64_t limiter_interval_ticks =
         std::max(uint64_t(1),
@@ -1318,9 +1396,10 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
     paint_context_.frame_limiter_next_present_tick += limiter_interval_ticks;
   }
   const bool strict_vsync_present = REXCVAR_GET(d3d12_strict_vsync_present);
-  UINT sync_interval = strict_vsync_present ? 1 : 0;
+  UINT sync_interval = display_sync_interval ? display_sync_interval
+                                             : (strict_vsync_present ? 1 : 0);
   UINT present_flags =
-      strict_vsync_present
+      sync_interval
           ? 0
           : (DXGI_PRESENT_RESTART |
              (paint_context_.swap_chain_allows_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0));

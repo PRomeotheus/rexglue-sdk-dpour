@@ -444,6 +444,19 @@ class D3D12CommandProcessor : public CommandProcessor {
                                                   uint32_t total_size) {
     return (uint64_t(first_base_address_dwords) << 32) | uint64_t(total_size);
   }
+  // perf/memexport-pacing: a readback ring must advance once per FRAME, not
+  // once per draw. When the same (address, size) memexport happened several
+  // times in one frame, the per-call ring pointed its read slot at a copy
+  // recorded earlier in the still-open submission, and CheckSubmissionFence
+  // on that submission closed it and drained the GPU mid-frame. Each
+  // occurrence of a key within a frame now owns its own ring, so occurrence N
+  // of this frame reads what occurrence N wrote two frames ago.
+  // Physical addresses are < 512 MB, so base_address_dwords fits in 27 bits
+  // (key bits 32..58); the occurrence index takes bits 59..63.
+  static constexpr uint32_t kMemexportMaxOccurrencesPerFrame = 32;
+  static inline uint64_t MakeMemexportOccurrenceKey(uint64_t base_key, uint32_t occurrence) {
+    return base_key | (uint64_t(occurrence) << 59);
+  }
 
   bool InitializeOcclusionQueryResources();
   void ShutdownOcclusionQueryResources();
@@ -695,6 +708,10 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint32_t readback_buffer_size_ = 0;
   std::unordered_map<uint64_t, ReadbackBuffer> readback_buffers_;
   std::unordered_map<uint64_t, ReadbackBuffer> memexport_readback_buffers_;
+  // Occurrences of each memexport base key in the current frame (reset when a
+  // frame opens). See MakeMemexportOccurrenceKey.
+  std::unordered_map<uint64_t, uint32_t> memexport_occurrences_this_frame_;
+  uint64_t memexport_occurrence_overflow_count_ = 0;
 
   static constexpr uint32_t kMaxOcclusionQueries = 8192;
   Microsoft::WRL::ComPtr<ID3D12QueryHeap> occlusion_query_heap_;
