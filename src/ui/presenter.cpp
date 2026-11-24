@@ -19,6 +19,7 @@
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
+#include <rex/ui/frame_timing.h>
 #include <rex/ui/presenter.h>
 #include <rex/ui/window.h>
 
@@ -703,6 +704,7 @@ bool Presenter::RefreshGuestOutput(
       return false;
     }
     guest_output_active_last_refresh_ = true;
+    rex::ui::frame_timing::NoteGuestFrame();
     if (GuestFrameStatsEnabled()) {
       std::lock_guard<std::mutex> stats_lock(guest_frame_stats_mutex_);
       guest_frame_timestamps_[guest_frame_timestamp_next_] = std::chrono::steady_clock::now();

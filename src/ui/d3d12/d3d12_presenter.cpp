@@ -12,6 +12,10 @@
 #include <algorithm>
 #include <atomic>
 #include <climits>
+#include <cstdio>
+#include <ctime>
+#include <filesystem>
+#include <string>
 #include <cmath>
 #include <chrono>
 #include <memory>
@@ -28,6 +32,8 @@
 #include <rex/ui/d3d12/d3d12_presenter.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
 #include <rex/ui/d3d12/d3d12_util.h>
+#include <rex/ui/frame_timing.h>
+#include <rex/filesystem.h>
 #include <rex/ui/surface_win.h>
 
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
@@ -91,6 +97,13 @@ REXCVAR_DEFINE_STRING(d3d12_present_pacing, "auto", "UI/D3D12",
                       "(host-clock cadence)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// perf/frame-timing: one CSV row per host present in logs/frametiming_*.csv,
+// for diagnosing uneven frame delivery that the PSO_STALL log (only frames
+// over 16 ms) cannot show.
+REXCVAR_DEFINE_BOOL(frame_timing_csv, false, "UI/D3D12",
+                    "Write per-present frame timing to logs/frametiming_<time>.csv")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_INT32(d3d12_present_frame_limiter_sleep_margin_us, 1000, "UI/D3D12",
                      "How early the present limiter wakes before the target present time")
     .range(0, 5000)
@@ -111,6 +124,75 @@ uint64_t TicksToUsInteger(uint64_t ticks, uint64_t frequency) {
 
 uint64_t UsToTicksInteger(uint64_t us, uint64_t frequency) {
   return us * frequency / 1000000ull;
+}
+
+struct FrameTimingWriter {
+  FILE* file = nullptr;
+  uint64_t rows = 0;
+  uint64_t last_present_tick = 0;
+  uint64_t last_guest_frames = 0;
+  bool failed = false;
+
+  void Row(uint64_t frequency, uint64_t paint_start, uint64_t wait_end, uint64_t present_start,
+           uint64_t present_end, UINT sync_interval, IDXGISwapChain3* swap_chain) {
+    if (!file && !failed) {
+      auto dir = rex::filesystem::GetExecutableFolder() / "logs";
+      std::error_code ec;
+      std::filesystem::create_directories(dir, ec);
+      auto path = dir / ("frametiming_" + std::to_string(std::time(nullptr)) + ".csv");
+      file = _wfopen(path.c_str(), L"wb");
+      if (!file) {
+        failed = true;
+        return;
+      }
+      std::fputs(
+          "row,t_ms,present_dt_us,latency_wait_us,paint_us,present_call_us,guest_new,"
+          "guest_age_us,guest_dt_us,sync_interval,dxgi_present_count,dxgi_present_refresh,"
+          "dxgi_sync_refresh\n",
+          file);
+    }
+    if (!file) return;
+    auto us = [frequency](uint64_t ticks) -> long long {
+      return frequency ? (long long)(ticks * 1000000ull / frequency) : 0;
+    };
+    const uint64_t guest_frames =
+        rex::ui::frame_timing::g_guest_frames.load(std::memory_order_acquire);
+    const uint64_t guest_tick =
+        rex::ui::frame_timing::g_last_guest_tick.load(std::memory_order_relaxed);
+    static uint64_t prev_guest_tick = 0;
+    const uint64_t guest_new = rows ? guest_frames - last_guest_frames : 0;
+    long long guest_dt = (guest_new && prev_guest_tick && guest_tick > prev_guest_tick)
+                             ? us(guest_tick - prev_guest_tick)
+                             : -1;
+    if (guest_new) prev_guest_tick = guest_tick;
+    DXGI_FRAME_STATISTICS stats = {};
+    const bool have_stats = SUCCEEDED(swap_chain->GetFrameStatistics(&stats));
+    std::fprintf(file, "%llu,%.3f,%lld,%lld,%lld,%lld,%llu,%lld,%lld,%u,%lld,%lld,%lld\n",
+                 (unsigned long long)rows, double(us(present_end)) / 1000.0,
+                 last_present_tick ? us(present_end - last_present_tick) : -1,
+                 us(wait_end - paint_start), us(present_start - wait_end),
+                 us(present_end - present_start), (unsigned long long)guest_new,
+                 guest_tick && present_end > guest_tick ? us(present_end - guest_tick) : -1,
+                 guest_dt, sync_interval,
+                 have_stats ? (long long)stats.PresentCount : -1,
+                 have_stats ? (long long)stats.PresentRefreshCount : -1,
+                 have_stats ? (long long)stats.SyncRefreshCount : -1);
+    last_present_tick = present_end;
+    last_guest_frames = guest_frames;
+    if ((++rows % 120) == 0) std::fflush(file);
+  }
+  void Close() {
+    if (file) {
+      std::fclose(file);
+      file = nullptr;
+    }
+    rows = 0;
+    last_present_tick = 0;
+  }
+};
+FrameTimingWriter& GetFrameTimingWriter() {
+  static FrameTimingWriter writer;
+  return writer;
 }
 
 // Refresh rate of the monitor the window is on, in Hz, or 0 if unknown.
@@ -747,11 +829,13 @@ void D3D12Presenter::PaintContext::DestroySwapChain() {
 Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawers) {
   const uint64_t host_frequency = rex::chrono::Clock::QueryHostTickFrequency();
   PROFILE_SCOPE_COUNTER(kCpuD3D12PaintTotalUs);
+  const uint64_t frame_timing_paint_start = rex::chrono::Clock::QueryHostTickCount();
   if (paint_context_.swap_chain_frame_latency_waitable &&
       paint_context_.swap_chain_frame_latency_waitable_object) {
     PROFILE_SCOPE_COUNTER(kCpuD3D12PresentWaitUs);
     WaitForSingleObjectEx(paint_context_.swap_chain_frame_latency_waitable_object, INFINITE, FALSE);
   }
+  const uint64_t frame_timing_wait_end = rex::chrono::Clock::QueryHostTickCount();
 
   // Begin the command list with the command allocator not currently potentially
   // used on the GPU.
@@ -1412,7 +1496,16 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   {
     PROFILE_SCOPE_COUNTER(kCpuD3D12PresentUs);
     auto present_start = std::chrono::steady_clock::now();
+    const uint64_t frame_timing_present_start = rex::chrono::Clock::QueryHostTickCount();
     present_result = paint_context_.swap_chain->Present(sync_interval, present_flags);
+    if (REXCVAR_GET(frame_timing_csv)) {
+      GetFrameTimingWriter().Row(host_frequency, frame_timing_paint_start, frame_timing_wait_end,
+                                 frame_timing_present_start,
+                                 rex::chrono::Clock::QueryHostTickCount(), sync_interval,
+                                 paint_context_.swap_chain.Get());
+    } else {
+      GetFrameTimingWriter().Close();
+    }
     rex::graphics::d3d12::PsoStallPresentNsAccumulator().fetch_add(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - present_start)
