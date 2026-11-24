@@ -420,6 +420,9 @@ class D3D12CommandProcessor : public CommandProcessor {
     uint32_t sizes[kReadbackBufferSlots] = {0, 0, 0};
     void* mapped_data[kReadbackBufferSlots] = {nullptr, nullptr, nullptr};
     uint64_t submission_written[kReadbackBufferSlots] = {0, 0, 0};
+    // Frame whose copy wrote each slot (see the batched wait in
+    // IssueDraw_MemexportReadbackFastPath).
+    uint64_t frame_written[kReadbackBufferSlots] = {0, 0, 0};
     uint32_t written_size[kReadbackBufferSlots] = {0, 0, 0};
     uint32_t current_index = 0;
     uint64_t last_used_frame = 0;

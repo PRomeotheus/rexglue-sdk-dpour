@@ -43,7 +43,12 @@ REXCVAR_DEFINE_BOOL(d3d12_strict_vsync_present, false, "UI/D3D12",
                     "Use DXGI Present(1, 0) instead of immediate tearing/restart present")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
-REXCVAR_DEFINE_BOOL(d3d12_frame_latency_waitable_object, false, "UI/D3D12",
+// perf/memexport-pacing: default flipped to true. With display-clock pacing
+// (d3d12_present_pacing auto/display) a vsync Present without this lets the
+// queue fill behind the display, and memexport readback then waits ~20 ms
+// per frame for work stuck in that queue (measured on a 60 Hz panel:
+// 59.8 s of fence waits vs 2.4 s with the waitable object at latency 1).
+REXCVAR_DEFINE_BOOL(d3d12_frame_latency_waitable_object, true, "UI/D3D12",
                     "Create the swapchain with a frame latency waitable object and wait before "
                     "painting")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);

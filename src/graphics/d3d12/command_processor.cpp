@@ -3551,6 +3551,7 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_s
     readback_offset += memexport_range.size_bytes;
   }
   readback.submission_written[write_index] = submission_current_;
+  readback.frame_written[write_index] = frame_current_;
   readback.written_size[write_index] = total_size;
 
   CheckSubmissionFence(0);
@@ -3593,7 +3594,20 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_s
     return true;
   }
   if (readback.submission_written[read_index] > submission_completed_) {
-    CheckSubmissionFence(readback.submission_written[read_index]);
+    // perf/memexport-pacing: wait for the WHOLE frame that wrote this slot,
+    // not just its own submission. After a scene change every first-use key
+    // takes the full path, which closes a submission each, so a frame can
+    // hold hundreds of tiny submissions; two frames later each key's read
+    // slot pointed at a different one and the fast path waited on them one
+    // by one (~670 waits, ~350 ms in one frame). One wait on the frame's
+    // last submission completes every slot written in that frame.
+    uint64_t await_submission = readback.submission_written[read_index];
+    const uint64_t written_frame = readback.frame_written[read_index];
+    if (written_frame < frame_current_ && written_frame + kQueueFrames >= frame_current_) {
+      await_submission =
+          std::max(await_submission, closed_frame_submissions_[written_frame % kQueueFrames]);
+    }
+    CheckSubmissionFence(await_submission);
   }
 
   const uint8_t* readback_bytes = static_cast<const uint8_t*>(readback.mapped_data[read_index]);
